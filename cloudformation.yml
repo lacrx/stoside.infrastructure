@@ -1,0 +1,644 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Strong Towns Oceanside -- full infrastructure.
+
+# ESTIMATED MONTHLY COST (us-east-1):
+#   EC2 t4g.small  ........... $12.26
+#   EBS 20 GB gp3  ...........  $1.60
+#   Public IPv4 (EIP) ........  $3.65
+#   S3 (< 1 GB) ..............  $0.10
+#   CloudFront (< 10 GB) .....  $0.85
+#   Route 53 queries .........  $0.40
+#   ACM certificate ...........  free
+#                                ------
+#   TOTAL ~ $18.86 / month  (t4g.small)
+#   TOTAL ~ $12.65 / month  (t4g.micro)
+#
+# PREREQUISITES:
+#   1. Create a Route 53 hosted zone for your domain (console or CLI).
+#   2. Update your domain registrar NS records to the Route 53 NS values.
+#   3. Wait for DNS propagation (5-60 min depending on registrar).
+#   4. Create an EC2 key pair in the target region.
+#   5. Deploy this stack IN us-east-1 (required for CloudFront ACM certs).
+#
+# DEPLOY:
+#   aws cloudformation deploy \
+#     --stack-name stoside \
+#     --template-file cloudformation.yml \
+#     --capabilities CAPABILITY_IAM \
+#     --region us-east-1 \
+#     --parameter-overrides \
+#       DomainName=stoside.org \
+#       HostedZoneId=Z0123456789EXAMPLE \
+#       KeyPairName=my-key \
+#       StrapiRepoUrl=https://github.com/user/strapi.git \
+#       FrontendRepoUrl=https://github.com/user/frontend.git
+#
+# AFTER DEPLOY:
+#   1. SSH to the CMS IP (see Outputs).
+#   2. Create your Strapi admin account at https://cms.<domain>/admin.
+#   Strapi, the frontend build, and S3 sync all run automatically via UserData.
+#   Check /var/log/user-data.log on the instance if anything fails.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Domain }
+        Parameters: [DomainName, HostedZoneId]
+      - Label: { default: Compute }
+        Parameters: [InstanceType, KeyPairName, SshCidr]
+      - Label: { default: Git Repositories }
+        Parameters: [StrapiRepoUrl, FrontendRepoUrl]
+    ParameterLabels:
+      DomainName: { default: Root domain name }
+      HostedZoneId: { default: Route 53 hosted zone ID }
+      InstanceType: { default: EC2 instance size }
+      KeyPairName: { default: SSH key pair name }
+      SshCidr: { default: Allowed SSH source CIDR }
+      StrapiRepoUrl: { default: Strapi Git clone URL }
+      FrontendRepoUrl: { default: Frontend Git clone URL }
+
+# ===============================================================
+
+#  PARAMETERS
+
+# ===============================================================
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: stoside.org
+    Description: Root domain (e.g. stoside.org). Must match the hosted zone.
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: >
+      ID of an EXISTING Route 53 hosted zone for DomainName.
+      Create one first, update your registrar NS records, then deploy this stack.
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.nano, t4g.micro, t4g.small]
+    Description: >
+      t4g.small ($12/mo, 2 vCPU, 2 GB) recommended.
+      t4g.micro ($6/mo, 2 vCPU, 1 GB) works for light usage.
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access to the CMS instance.
+  SshCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to SSH. Restrict to your IP (e.g. 203.0.113.5/32).
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  StrapiRepoUrl:
+    Type: String
+    Description: HTTPS Git clone URL for the Strapi CMS repo.
+  FrontendRepoUrl:
+    Type: String
+    Description: HTTPS Git clone URL for the Gatsby frontend repo.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 ARM64 AMI (auto-resolved).
+
+# ===============================================================
+
+#  RESOURCES
+
+# ===============================================================
+
+Resources:
+  # --- NETWORKING ---------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public'
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rt'
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} CMS instance'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshCidr
+          Description: SSH
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP - Caddy ACME and redirect
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS - Caddy to Strapi
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sg'
+  # --- IAM ----------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StrapiMediaS3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${MediaBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt MediaBucket.Arn
+        - PolicyName: FrontendDeploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FrontendBucket.Arn
+                  - !Sub '${FrontendBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+  # --- COMPUTE ------------------------------------------------
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-eip'
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: GatewayAttachment
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-strapi'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          # System updates
+          dnf update -y
+
+          # Docker
+          dnf install -y docker git
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+
+          # Docker Compose v2 + Buildx plugins
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          ARCH=$(uname -m)
+          curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${!ARCH}" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+          BUILDX_ARCH=$(echo ${!ARCH} | sed 's/aarch64/arm64/' | sed 's/x86_64/amd64/')
+          curl -SL "https://github.com/docker/buildx/releases/latest/download/buildx-v0.33.0.linux-${!BUILDX_ARCH}" \
+            -o /usr/local/lib/docker/cli-plugins/docker-buildx
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+
+          # Swap (helps on small instances)
+          fallocate -l 1G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+
+          # Node.js 22 (for Gatsby build)
+          curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+          dnf install -y nodejs
+
+          # ── Strapi CMS setup ──
+          mkdir -p /opt/strapi
+          chown ec2-user:ec2-user /opt/strapi
+          cd /opt/strapi
+          git clone -b develop ${StrapiRepoUrl}
+
+          cd /opt/strapi/stoside.cms/strapi.cms
+
+          # Generate .env.production with random secrets
+          echo "HOST=0.0.0.0" > .env.production
+          echo "PORT=1337" >> .env.production
+
+          # Append generated secrets (must use shell expansion, not heredoc quoting)
+          echo "APP_KEYS=$(openssl rand -base64 32),$(openssl rand -base64 32)" >> .env.production
+          echo "ADMIN_JWT_SECRET=$(openssl rand -base64 32)" >> .env.production
+          echo "API_TOKEN_SALT=$(openssl rand -base64 32)" >> .env.production
+          echo "ENCRYPTION_KEY=$(openssl rand -base64 32)" >> .env.production
+          echo "TRANSFER_TOKEN_SALT=$(openssl rand -base64 32)" >> .env.production
+          echo "JWT_SECRET=$(openssl rand -base64 32)" >> .env.production
+          DB_PASS=$(openssl rand -base64 32)
+          echo "DATABASE_PASSWORD=${!DB_PASS}" >> .env.production
+          echo "AWS_REGION=${AWS::Region}" >> .env.production
+          echo "AWS_S3_BUCKET=${MediaBucket}" >> .env.production
+          echo "MEDIA_URL=https://media.${DomainName}" >> .env.production
+
+          chown ec2-user:ec2-user .env.production
+          chmod 600 .env.production
+
+          # Restore Caddy TLS certificates from S3 (avoids Let's Encrypt rate limits)
+          CADDY_BACKUP=s3://${FrontendBucket}/_caddy/caddy_data.tar.gz
+          if aws s3 cp "$CADDY_BACKUP" /tmp/caddy_data.tar.gz 2>/dev/null; then
+            echo "Restoring Caddy TLS data from S3..."
+            docker volume create strapicms_caddy_data
+            docker run --rm -v strapicms_caddy_data:/data -v /tmp:/backup alpine \
+              sh -c "tar xzf /backup/caddy_data.tar.gz -C /data"
+            rm /tmp/caddy_data.tar.gz
+          else
+            echo "No Caddy TLS backup found in S3, will obtain new cert."
+          fi
+
+          # Start Strapi
+          docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+
+          # Wait for Strapi to be healthy (up to 5 min)
+          echo "Waiting for Strapi to become healthy..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:1337/_health > /dev/null 2>&1; then
+              echo "Strapi is healthy."
+              break
+            fi
+            sleep 5
+          done
+
+          # Backup Caddy TLS data to S3 (for reuse across stack recreates)
+          echo "Backing up Caddy TLS data to S3..."
+          sleep 30   # give Caddy time to obtain/load cert
+          docker run --rm -v strapicms_caddy_data:/data -v /tmp:/backup alpine \
+            tar czf /backup/caddy_data.tar.gz -C /data .
+          aws s3 cp /tmp/caddy_data.tar.gz "$CADDY_BACKUP"
+          rm /tmp/caddy_data.tar.gz
+          echo "Caddy TLS data backed up."
+
+          # ── Frontend build and deploy ──
+          mkdir -p /opt/frontend
+          chown ec2-user:ec2-user /opt/frontend
+          cd /opt/frontend
+          git clone ${FrontendRepoUrl} .
+
+          # Set Strapi endpoint for Gatsby build
+          export STRAPI_URL=http://localhost:1337
+
+          npm ci
+          npx gatsby build
+
+          # Sync to S3 and invalidate CloudFront
+          aws s3 sync public/ s3://${FrontendBucket} --delete
+          aws cloudfront create-invalidation \
+            --distribution-id ${FrontendDistribution} \
+            --paths "/*"
+
+          echo "=== user-data complete ==="
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref Instance
+      AllocationId: !GetAtt ElasticIP.AllocationId
+  # --- STORAGE (S3) ------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: gatsby-frontend
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins:
+              - !Sub 'https://${DomainName}'
+              - !Sub 'https://cms.${DomainName}'
+            MaxAge: 3600
+      Tags:
+        - Key: Purpose
+          Value: strapi-media
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${MediaBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${MediaDistribution}'
+  # --- TLS ----------------------------------------------------
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub '*.${DomainName}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+  # --- CDN (CloudFront) --------------------------------------
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-frontend-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  MediaOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-media-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  UrlRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-url-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Append index.html to bare paths for Gatsby static output
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri.endsWith('/')) {
+            request.uri += 'index.html';
+          } else if (!uri.includes('.')) {
+            request.uri += '/index.html';
+          }
+          return request;
+        }
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        DefaultRootObject: index.html
+        Aliases:
+          - !Ref DomainName
+          - !Sub 'www.${DomainName}'
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+        Origins:
+          - Id: S3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt UrlRewriteFunction.FunctionARN
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 60
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 60
+      Tags:
+        - Key: Purpose
+          Value: gatsby-frontend
+  MediaDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        Aliases:
+          - !Sub 'media.${DomainName}'
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+        Origins:
+          - Id: S3
+            DomainName: !GetAtt MediaBucket.RegionalDomainName
+            OriginAccessControlId: !Ref MediaOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+          Compress: true
+      Tags:
+        - Key: Purpose
+          Value: strapi-media
+  # --- DNS RECORDS --------------------------------------------
+  ApexRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt FrontendDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2   # Global CloudFront hosted zone
+  WwwRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${DomainName}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt FrontendDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+  CmsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'cms.${DomainName}'
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !Ref ElasticIP
+  MediaRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'media.${DomainName}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt MediaDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+# ===============================================================
+
+#  OUTPUTS
+
+# ===============================================================
+
+Outputs:
+  CmsIp:
+    Description: Elastic IP for the CMS instance. SSH with your key pair.
+    Value: !Ref ElasticIP
+  CmsUrl:
+    Description: Strapi admin panel URL (available after Caddy + Strapi are running).
+    Value: !Sub 'https://cms.${DomainName}/admin'
+  FrontendUrl:
+    Description: Public website URL.
+    Value: !Sub 'https://${DomainName}'
+  FrontendBucketName:
+    Description: S3 bucket for Gatsby build output. Sync with "aws s3 sync public/ s3://<bucket>".
+    Value: !Ref FrontendBucket
+  MediaBucketName:
+    Description: S3 bucket for Strapi media uploads. Set as AWS_S3_BUCKET in .env.production.
+    Value: !Ref MediaBucket
+  MediaUrl:
+    Description: CDN URL for media. Set as MEDIA_URL in .env.production.
+    Value: !Sub 'https://media.${DomainName}'
+  FrontendDistributionId:
+    Description: CloudFront distribution ID. Invalidate after deploy with "aws cloudfront create-invalidation".
+    Value: !Ref FrontendDistribution
+  DeployFrontendCommand:
+    Description: One-liner to deploy the Gatsby frontend (run from stoside.frontend/).
+    Value: !Sub >
+      gatsby build &&
+      aws s3 sync public/ s3://${FrontendBucket} --delete &&
+      aws cloudfront create-invalidation --distribution-id ${FrontendDistribution} --paths "/*"
+
