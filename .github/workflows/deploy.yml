@@ -1,0 +1,38 @@
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name stoside \
+            --template-file cloudformation.yml \
+            --capabilities CAPABILITY_IAM \
+            --region us-east-1 \
+            --parameter-overrides \
+              DomainName=${{ secrets.DOMAIN_NAME }} \
+              HostedZoneId=${{ secrets.HOSTED_ZONE_ID }} \
+              KeyPairName=${{ secrets.KEY_PAIR_NAME }} \
+              StrapiRepoUrl=${{ secrets.STRAPI_REPO_URL }} \
+              FrontendRepoUrl=${{ secrets.FRONTEND_REPO_URL }} \
+            --no-fail-on-empty-changeset
